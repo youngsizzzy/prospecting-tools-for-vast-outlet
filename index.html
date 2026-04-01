@@ -647,36 +647,60 @@ async function runAIVis(){
   const dom=gdom(url);
   const bizName=document.getElementById('aivBiz').value.trim()||dom.replace(/^www\./,'').split('.')[0];
   const niche=document.getElementById('aivNiche').value.trim()||'Business';
-  // Fetch PageSpeed to get real data where possible
+
+  // Step 1 — get real PageSpeed score
   let perf=null,mob=null,hasHttps=url.startsWith('https');
   try{
     const r=await fetch(`https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=${encodeURIComponent(url)}&strategy=mobile`);
     if(r.ok){const d=await r.json();const cats=d.lighthouseResult?.categories;perf=Math.round((cats?.performance?.score||0.4)*100);mob=Math.round((cats?.['best-practices']?.score||0.5)*100);}
   }catch(e){}
   if(perf===null){perf=Math.floor(Math.random()*35)+25;mob=Math.floor(Math.random()*30)+30;}
-  // Score each check — deterministic simulation based on url + real signals
+
+  // Step 2 — call real Netlify function to check actual HTML
+  let rawResults=null;
+  try{
+    const fnRes=await fetch('https://voluble-puppy-e12582.netlify.app/.netlify/functions/check-visibility',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({url,mobileScore:mob})
+    });
+    if(fnRes.ok){
+      const fnData=await fnRes.json();
+      if(fnData.success)rawResults=fnData.results;
+    }
+  }catch(e){console.warn('Function error:',e);}
+
+  // Step 3 — map function results onto AIV_CHECKS (fallback to simulation if function failed)
   const seed=url.split('').reduce((a,c)=>a+c.charCodeAt(0),0);
   function chance(offset,threshold){return((seed+offset)%100)<threshold;}
   const results=AIV_CHECKS.map(c=>{
-    let pass=false;
-    if(c.id==='https')pass=hasHttps;
-    else if(c.id==='schema')pass=chance(1,35);
-    else if(c.id==='nap')pass=chance(2,50);
-    else if(c.id==='faq')pass=chance(3,25);
-    else if(c.id==='title')pass=chance(4,60);
-    else if(c.id==='meta')pass=chance(5,55);
-    else if(c.id==='h1')pass=chance(6,65);
-    else if(c.id==='mobile')pass=perf>=60;
-    else if(c.id==='reviews')pass=chance(8,30);
-    else if(c.id==='content')pass=chance(9,45);
-    return{...c,pass};
+    let pass=false,detail='';
+    if(rawResults&&rawResults[c.id]){
+      pass=rawResults[c.id].pass;
+      detail=rawResults[c.id].detail||'';
+    } else {
+      // fallback simulation
+      if(c.id==='https')pass=hasHttps;
+      else if(c.id==='schema')pass=chance(1,35);
+      else if(c.id==='nap')pass=chance(2,50);
+      else if(c.id==='faq')pass=chance(3,25);
+      else if(c.id==='title')pass=chance(4,60);
+      else if(c.id==='meta')pass=chance(5,55);
+      else if(c.id==='h1')pass=chance(6,65);
+      else if(c.id==='mobile')pass=perf>=60;
+      else if(c.id==='reviews')pass=chance(8,30);
+      else if(c.id==='content')pass=chance(9,45);
+    }
+    return{...c,pass,detail};
   });
+
   const totalWeight=AIV_CHECKS.reduce((s,c)=>s+c.weight,0);
   const earned=results.filter(r=>r.pass).reduce((s,r)=>s+r.weight,0);
   const score=Math.round((earned/totalWeight)*100);
   const passed=results.filter(r=>r.pass).length;
   const failed=results.filter(r=>!r.pass).length;
-  curAIVis={url,dom,bizName,niche,score,passed,failed,results,perf,mob,hasHttps};
+  const dataSource=rawResults?'real':'simulated';
+  curAIVis={url,dom,bizName,niche,score,passed,failed,results,perf,mob,hasHttps,dataSource};
   renderAIVis(curAIVis);
   btn.disabled=false;btn.textContent='Check Now';
 }
@@ -687,8 +711,9 @@ function renderAIVis(d){
   const ring=document.getElementById('aivRing');ring.style.stroke=color;
   setTimeout(()=>{ring.style.strokeDashoffset=213.6-(213.6*sc/100);},100);
   document.getElementById('aivTitle').textContent=`${d.bizName} — AI Visibility Score`;
-  const verdict=sc>=70?'This site has solid AI visibility signals.':sc>=45?'Partially visible to AI — key signals missing.':'Near-invisible to AI search engines.';
-  document.getElementById('aivVerdict').textContent=verdict;
+  const verdict=sc>=70?'Good AI visibility — solid signals in place.':sc>=45?'Partially visible to AI — key signals missing.':'Near-invisible to AI search engines like ChatGPT & Perplexity.';
+  const srcBadge=d.dataSource==='real'?'<span style="font-size:10px;background:rgba(0,212,170,.15);color:var(--good);border:1px solid rgba(0,212,170,.3);border-radius:20px;padding:2px 8px;margin-left:6px">✓ Real scan</span>':'<span style="font-size:10px;background:rgba(255,184,48,.1);color:var(--warn);border:1px solid rgba(255,184,48,.3);border-radius:20px;padding:2px 8px;margin-left:6px">⚠ Estimated</span>';
+  document.getElementById('aivVerdict').innerHTML=verdict+srcBadge;
   document.getElementById('aivPassCount').textContent=`${d.passed} pass · ${d.failed} fail`;
   document.getElementById('aivChecklist').innerHTML=d.results.map(r=>`
     <div class="ii" style="border-color:${r.pass?'rgba(0,212,170,.2)':'rgba(255,71,87,.15)'}">
@@ -696,11 +721,12 @@ function renderAIVis(d){
       <div style="flex:1">
         <div style="font-weight:500;font-size:12px;margin-bottom:2px;color:${r.pass?'var(--good)':'var(--text)'}">${r.label}</div>
         <div style="font-size:11px;color:var(--muted);line-height:1.5">${r.desc}</div>
+        ${r.detail?`<div style="font-size:10px;color:${r.pass?'var(--good)':'var(--warn)'};margin-top:3px;font-style:italic">${r.detail}</div>`:''}
       </div>
       <div style="font-size:10px;font-weight:700;color:${r.pass?'var(--good)':'var(--bad)'};flex-shrink:0">+${r.weight}pts${r.pass?'':' missed'}</div>
     </div>`).join('');
   const topFails=d.results.filter(r=>!r.pass).slice(0,3).map(r=>r.label).join(', ');
-  document.getElementById('aivPitchTxt').textContent=`I ran an AI visibility check on ${d.dom} and it scored ${d.score}/100 — meaning it's ${d.score<45?'nearly invisible':'only partially visible'} to AI search engines like ChatGPT, Perplexity, and Google AI Overviews. The biggest gaps: ${topFails}. I can fix all of this and get ${d.bizName} showing up where their competitors aren't even looking yet.`;
+  document.getElementById('aivPitchTxt').textContent=`I ran an AI visibility check on ${d.dom} and it scored ${d.score}/100 — meaning it's ${d.score<45?'near-invisible':'only partially visible'} to AI search engines like ChatGPT, Perplexity, and Google AI Overviews. The biggest gaps: ${topFails}. I can fix all of this and get ${d.bizName} showing up where their competitors aren't even looking yet.`;
 }
 function aivCopyPitch(){
   if(!curAIVis)return;
